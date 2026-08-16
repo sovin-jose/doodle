@@ -1,0 +1,10 @@
+/mvnw text eol=lf
+*.cmd text eol=crlf
+/.classpath
+/.externalToolBuilders
+/.project
+/.settings
+/target
+*.iml
+.DS_Store
+.idea/
