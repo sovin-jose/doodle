@@ -10,6 +10,9 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.time.ZoneId;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
 import java.util.UUID;
 
 @Service
@@ -41,5 +44,20 @@ public class UserService {
         Calendar calendar = calendars.findByOwnerId(user.getId())
                 .orElseThrow(() -> new NotFoundException("calendar not found for user: " + id));
         return UserResponse.of(user, calendar);
+    }
+
+    @Transactional(readOnly = true)
+    public List<UserResponse> listAll() {
+        List<User> allUsers = users.findAll();
+        if (allUsers.isEmpty()) {
+            return List.of();
+        }
+        Map<UUID, Calendar> calendarByOwner = new HashMap<>();
+        for (Calendar c : calendars.findAll()) {
+            calendarByOwner.put(c.getOwner().getId(), c);
+        }
+        return allUsers.stream()
+                .map(u -> UserResponse.of(u, calendarByOwner.get(u.getId())))
+                .toList();
     }
 }

@@ -51,6 +51,21 @@ keep your data. To wipe everything:
 docker compose down -v
 ```
 
+### The React UI is part of the compose stack
+
+`docker compose up --build` starts **three** services:
+
+| Service | URL | What it is |
+| --- | --- | --- |
+| `frontend` | http://localhost:3001 | React SPA served by nginx; proxies `/api` + `/actuator` to `app` |
+| `app`      | http://localhost:8080 | Spring Boot backend (also reachable directly) |
+| `postgres` | localhost:5432        | PostgreSQL 16 |
+
+So opening `http://localhost:3000` gives you the full UI without touching npm.
+
+If you'd rather run the frontend with hot-reload for development, see
+[`frontend/README.md`](./frontend/README.md).
+
 ---
 
 ## Running without Docker (optional)

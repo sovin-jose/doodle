@@ -13,6 +13,7 @@ import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 
 import java.net.URI;
+import java.util.List;
 import java.util.UUID;
 
 @RestController
@@ -34,5 +35,10 @@ public class UserController {
     @GetMapping("/{id}")
     public UserResponse get(@PathVariable UUID id) {
         return userService.get(id);
+    }
+
+    @GetMapping
+    public List<UserResponse> list() {
+        return userService.listAll();
     }
 }
