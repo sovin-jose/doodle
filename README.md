@@ -1,258 +1,126 @@
-# Doodle — Mini Meeting Scheduling Platform
+# Mini Doodle
 
-A small Spring Boot service that simulates the core of a Doodle-style scheduling
-platform: users own calendars, expose available time slots, and turn free slots
-into meetings with participants.
+A small Spring Boot service that lets users define time slots on a personal calendar and turn free slots into meetings with participants. The word "calendar" only lives in the domain layer — there's no `/calendars` REST resource, per the brief.
 
-The "calendar" is an internal domain concept — it is created 1:1 with each user
-and is never exposed directly as a REST resource.
+## Stack
 
----
+Java 21, Spring Boot 4.1, PostgreSQL 16, Flyway for schema migrations, JUnit + Mockito for tests, springdoc for OpenAPI, Micrometer/Prometheus for metrics. Frontend is a tiny Vite + React + TypeScript SPA served by nginx. Everything runs from one `docker compose up`.
 
-## Tech stack
-
-| Layer          | Choice                                           |
-| -------------- | ------------------------------------------------ |
-| Language       | Java 21                                          |
-| Framework      | Spring Boot 4.1                                  |
-| Persistence    | Spring Data JPA / Hibernate                      |
-| Database       | PostgreSQL 16                                    |
-| Migrations     | Flyway                                           |
-| Docs           | springdoc OpenAPI / Swagger UI                   |
-| Metrics        | Spring Actuator + Micrometer / Prometheus        |
-| Tests          | JUnit 5 + Mockito + AssertJ                      |
-| Build          | Maven (wrapper included: `./mvnw`)               |
-| Packaging      | Multi-stage Docker image (Temurin JDK 21 → JRE)  |
-| Orchestration  | docker compose                                   |
-
----
-
-## Run it — one command
-
-Prerequisites: Docker Desktop (or Docker Engine) with the `compose` plugin.
+## Running it
 
 ```bash
 docker compose up --build
 ```
 
-That's it. The compose file:
+Three containers come up:
 
-1. Boots `postgres:16-alpine` with database `doodle` (user/password: `doodle`).
-2. Waits until Postgres is healthy (`pg_isready`).
-3. Builds the app image from the multi-stage `Dockerfile`.
-4. Starts the app on `http://localhost:8080` with `SPRING_DATASOURCE_URL`,
-   `SPRING_DATASOURCE_USERNAME`, `SPRING_DATASOURCE_PASSWORD` wired to Postgres.
-5. Flyway automatically runs `V1__init_schema.sql` on first startup.
-
-Postgres data is persisted in the named volume `postgres_data`, so restarts
-keep your data. To wipe everything:
-
-```bash
-docker compose down -v
-```
-
-### The React UI is part of the compose stack
-
-`docker compose up --build` starts **three** services:
-
-| Service | URL | What it is |
+| Service | URL | What |
 | --- | --- | --- |
-| `frontend` | http://localhost:3001 | React SPA served by nginx; proxies `/api` + `/actuator` to `app` |
-| `app`      | http://localhost:8080 | Spring Boot backend (also reachable directly) |
-| `postgres` | localhost:5432        | PostgreSQL 16 |
+| `postgres` | localhost:5432 | Postgres 16, db/user/pass all `doodle` |
+| `app` | http://localhost:8080 | Spring Boot backend |
+| `frontend` | http://localhost:3001 | React SPA + nginx, proxies `/api` and `/actuator` back to `app` |
 
-So opening `http://localhost:3000` gives you the full UI without touching npm.
+Open http://localhost:3001. Data lives in the `postgres_data` named volume, so restarts keep your users and slots around. `docker compose down -v` wipes it.
 
-If you'd rather run the frontend with hot-reload for development, see
-[`frontend/README.md`](./frontend/README.md).
-
----
-
-## Running without Docker (optional)
-
-If you'd rather run the JVM locally against a Postgres you already have:
+If you'd rather run the JVM against your own Postgres:
 
 ```bash
-# 1. Have a Postgres reachable at localhost:5432 with db/user/password 'doodle'
-# 2. Build and run
-./mvnw spring-boot:run
-```
-
-Override the datasource with env vars if needed:
-
-```bash
-SPRING_DATASOURCE_URL=jdbc:postgresql://my-host:5432/mydb \
+SPRING_DATASOURCE_URL=jdbc:postgresql://localhost:5432/mydb \
 SPRING_DATASOURCE_USERNAME=me \
 SPRING_DATASOURCE_PASSWORD=secret \
 ./mvnw spring-boot:run
 ```
 
----
-
-## Domain model
+## Domain
 
 ```
-User ─┬─(1:1)─ Calendar ─(1:N)─ Slot ─(0..1)─ Meeting ─(1:N)─ MeetingParticipant
-      │                                                        │
-      └────────────────── organizer / participant ──────────────┘
+User ──1:1── Calendar ──1:N── Slot ──0..1── Meeting ──1:N── MeetingParticipant
 ```
 
-- **User** — `id`, `name`, unique `email`.
-- **Calendar** — 1:1 with a User; carries the owner's `timezone`.
-- **Slot** — belongs to a Calendar; `start_time`, `end_time`, `status`
-  (`FREE` / `BUSY` / `BOOKED`), plus `@Version` for optimistic locking.
-- **Meeting** — 1:1 with a `BOOKED` Slot; has `title`, `description`, organizer.
-- **MeetingParticipant** — join between Meeting and User with
-  `response_status` (`PENDING` / `ACCEPTED` / `DECLINED`).
+A slot has one of three statuses: `FREE`, `BUSY`, `BOOKED`. Only `FREE` slots can be booked. Booking creates a `Meeting` and flips the slot to `BOOKED`. Cancelling a meeting deletes it and returns the slot to `FREE`.
 
-`slots` has a composite index on `(calendar_id, start_time, end_time)` for fast
-range queries; overlap detection uses the classic
-`start < :end AND end > :start` predicate.
+A few decisions worth calling out up front rather than in a design-notes appendix:
 
----
+- Overlap detection runs at the service layer via a `count(*)` query against a composite index on `(calendar_id, start_time, end_time)`. Fast enough for the brief's "thousands of slots" but not race-proof under high concurrency. A Postgres `EXCLUDE USING GIST` constraint would be the bulletproof answer. See notes at the bottom for why I didn't add it.
+- `@Version` on `Slot` catches the concurrent-booking race and returns a 409 instead of silently double-booking.
+- `spring.jpa.open-in-view=false`. Lazy-load bugs surface in tests instead of hiding until an HTTP call trips them.
 
-## HTTP API
+## API
 
-Base URL: `http://localhost:8080`
+Base URL http://localhost:8080. All JSON. Errors look like this:
+
+```json
+{ "timestamp": "…", "status": 409, "error": "Conflict", "message": "slot overlaps an existing slot" }
+```
+
+404 for not-found, 409 for conflicts (overlap or bad state transition), 400 for validation.
 
 ### Users
 
 ```http
-POST /api/users
-Content-Type: application/json
-
-{
-  "name": "Ada Lovelace",
-  "email": "ada@example.com",
-  "timezone": "Europe/London"
-}
+POST /api/users        # { name, email, timezone? }
+GET  /api/users        # list all
+GET  /api/users/{id}
 ```
 
-Response `201 Created` — includes the auto-created `calendarId`.
-
-```http
-GET /api/users/{id}
-```
+Creating a user also provisions their Calendar behind the scenes. The response includes the `calendarId` for reference, but you never address it directly.
 
 ### Slots
 
 ```http
-POST /api/users/{userId}/slots
-Content-Type: application/json
-
-{
-  "startTime": "2026-09-01T09:00:00Z",
-  "endTime":   "2026-09-01T09:30:00Z",
-  "status":    "FREE"
-}
-```
-
-Rejects overlaps with the user's existing slots (`409 Conflict`). Direct
-creation as `BOOKED` is not allowed — book a meeting instead.
-
-```http
-GET /api/users/{userId}/slots?from=2026-09-01T00:00:00Z&to=2026-09-02T00:00:00Z&status=FREE
-PATCH /api/slots/{slotId}/status?status=BUSY
+POST   /api/users/{userId}/slots            # { startTime, endTime, status? }
+GET    /api/users/{userId}/slots?from=&to=&status=
+PATCH  /api/slots/{slotId}/status?status=BUSY|FREE
 DELETE /api/slots/{slotId}
 ```
 
-`status` on the list endpoint is optional. Booked slots cannot be deleted
-without cancelling their meeting first.
+Two rules that come back as 409:
+
+- You can't create a slot as `BOOKED` directly. Booking a meeting is what flips it.
+- You can't delete a booked slot without cancelling its meeting first.
 
 ### Meetings
 
 ```http
-POST /api/meetings
-Content-Type: application/json
-
-{
-  "slotId":       "…",
-  "organizerId":  "…",
-  "title":        "Sprint planning",
-  "description":  "Weekly review",
-  "participantIds": ["…", "…"]
-}
-```
-
-Transitions the slot from `FREE` → `BOOKED` atomically. Returns the meeting
-with participant response statuses (all start as `PENDING`).
-
-```http
-GET /api/meetings/{id}
-GET /api/meetings?organizerId={userId}
+POST   /api/meetings   # { slotId, organizerId, title, description?, participantIds? }
+GET    /api/meetings?organizerId=…
+GET    /api/meetings/{id}
 DELETE /api/meetings/{id}
 ```
 
-Cancelling a meeting removes the meeting (and its participants) and transitions
-the underlying slot back to `FREE`, freeing the time for a new booking.
+Booking is a single transaction: the slot goes `FREE` → `BOOKED`, the meeting is inserted, participant rows are written. Cancelling reverses it.
 
-### Aggregated availability (the "mini Doodle" endpoint)
+### Availability
 
-Given a set of participants and a time window, returns per-user free/busy
-timelines and — most importantly — the **common free intervals** where a
-meeting could be scheduled with everyone.
+The actual mini-Doodle bit — given a set of participants and a window, find the common free time:
 
 ```http
-GET /api/availability?userIds=<uuid>,<uuid>,<uuid>&from=2026-09-01T09:00:00Z&to=2026-09-01T18:00:00Z
+GET /api/availability?userIds=a,b,c&from=…&to=…
 ```
 
 Response:
 
 ```json
 {
-  "from": "2026-09-01T09:00:00Z",
-  "to":   "2026-09-01T18:00:00Z",
+  "from": "…",
+  "to": "…",
   "users": [
-    {
-      "userId": "…",
-      "free":  [{"start":"2026-09-01T09:00:00Z","end":"2026-09-01T10:30:00Z"}],
-      "busy":  [{"start":"2026-09-01T10:30:00Z","end":"2026-09-01T11:00:00Z"}]
-    }
+    { "userId": "a", "free": [...], "busy": [...] }
   ],
   "commonFree": [
-    {"start":"2026-09-01T09:30:00Z","end":"2026-09-01T10:30:00Z"}
+    { "start": "…", "end": "…" }
   ]
 }
 ```
 
-Implementation notes:
-- Single SQL query fetches all overlapping slots across the requested users in
-  one round-trip using the composite `(calendar_id, start_time, end_time)` index.
-- Per-user free intervals are merged, then intersected pairwise
-  (two-pointer sweep) to compute the common free windows.
-- Slots that straddle the window boundary are clipped so results always fit in
-  `[from, to]`.
+Implementation is one query that pulls every overlapping slot for the requested users (using the composite index), then a two-pointer sweep across each user's free intervals to compute the intersection. Slots that straddle the window boundary get clipped.
 
-### Error shape
-
-```json
-{
-  "timestamp": "2026-08-16T12:34:56.789Z",
-  "status": 409,
-  "error": "Conflict",
-  "message": "slot overlaps an existing slot"
-}
-```
-
-Mapping: `404` for not-found, `409` for conflict (overlap / bad state
-transition), `400` for validation errors.
-
----
+Interactive Swagger UI at http://localhost:8080/swagger-ui.html.
 
 ## Observability
 
-| Endpoint                    | Purpose                                   |
-| --------------------------- | ----------------------------------------- |
-| `/actuator/health`          | Liveness/readiness (used by compose)      |
-| `/actuator/info`            | Build metadata                            |
-| `/actuator/metrics`         | JVM + HTTP + Hikari metrics (JSON)        |
-| `/actuator/prometheus`      | Prometheus scrape endpoint                |
-| `/swagger-ui.html`          | Interactive API explorer                  |
-| `/v3/api-docs`              | OpenAPI 3 JSON spec                       |
-
-The compose file's `app` service has an HTTP healthcheck on
-`/actuator/health` and Postgres has a `pg_isready` healthcheck, so
-`docker compose up --wait` will block until both are truly ready.
+`/actuator/health` — used by compose to gate the frontend on the backend being healthy.
+`/actuator/prometheus` — Micrometer scrape endpoint, JVM + HTTP + Hikari metrics.
 
 ## Tests
 
@@ -260,103 +128,29 @@ The compose file's `app` service has an HTTP healthcheck on
 ./mvnw test
 ```
 
-Currently 17 unit tests covering:
+17 Mockito unit tests, run in about a second, no Postgres needed. They cover overlap detection, state transition rules, cancellation restoring `FREE`, and the interval-intersection math in the availability service. There's no integration test yet — see next steps.
 
-- Slot overlap detection, start/end validation, deletion guards, status
-  transition rules (`SlotServiceTest`)
-- Meeting booking transitions the slot to `BOOKED`, cancellation returns it to
-  `FREE`, non-`FREE` slots are rejected (`MeetingServiceTest`)
-- Availability aggregation: interval merging, cross-user intersection, window
-  clipping, empty-input validation (`AvailabilityServiceTest`)
+## Assumptions and trade-offs
 
-The tests are Mockito-based and infra-free — they run in ~1 second and don't
-require Postgres. A Testcontainers-Postgres integration test is called out in
-"Next steps" and would validate the migration script + repository queries end
-to end.
+Things I decided about, some of which aren't obvious from the code:
 
-## Database migrations
+- **No auth.** The API trusts the `userId` in the path — any caller can act as any user. In production you'd take identity from a JWT and gate writes to the caller's own calendar. Explicitly out of scope for a demo.
+- **UTC internally, always.** The frontend `datetime-local` inputs are treated as UTC, which is technically wrong but avoids pulling in `date-fns-tz` for a demo. A real product needs proper user-timezone handling.
+- **Flyway is wired manually in `FlywayBootstrap.java`.** Spring Boot 4.1's Flyway auto-configuration wasn't firing for this project (no Flyway logs at startup, no `flyway_schema_history` table ever created). I switched to defining the bean explicitly with `initMethod = "migrate"`. Non-idiomatic, but reliable, and the class comment explains it. Would revisit once Boot 4.x autoconfig behaviour is clearer to me.
+- **App-level overlap detection.** See above.
+- **Slots are `[start, end)`, not `(startAt, durationMinutes)`.** Same information, different shape. The brief phrases it as "configurable duration" — if the product actually needed fixed-duration templates you'd add a helper that materialises N slots of duration D.
+- **No pagination on list endpoints.** Fine for a few thousand slots per user, would need cursor pagination past that.
 
-Managed by Flyway from `src/main/resources/db/migration`.
+## What I'd do with more time
 
-- Migrations run automatically at application startup.
-- Hibernate is set to `ddl-auto=none` — Flyway is the single source of truth
-  for schema changes.
-- The V1 script uses `CREATE TABLE IF NOT EXISTS`, so pointing the app at a
-  Postgres that already has the tables is safe.
+Rough priority order:
 
-To add a new migration: drop `V2__something.sql` (or `V3__…`) into the
-migration folder and restart. `spring.flyway.baseline-on-migrate=true` is set
-so Flyway can adopt a pre-existing empty schema without complaining.
+1. **Testcontainers-Postgres integration test.** The unit tests mock the repository, which means the JPQL and the migration script aren't actually exercised. A single end-to-end test that boots a real Postgres, applies the migration, and runs `SlotRepository.existsOverlap` + `findOverlappingForUsers` would close that gap.
+2. **`EXCLUDE USING GIST` constraint** in a V2 migration once `btree_gist` is enabled. Turns overlap prevention into a race-proof DB guarantee instead of an app-layer race.
+3. **Participant response endpoint** — `PATCH /api/meetings/{id}/participants/{userId}?status=ACCEPTED`. The column and enum exist, the endpoint doesn't.
+4. **Auth.**
+5. **Pagination.**
 
----
+## Notes on the frontend
 
-## Quick smoke test
-
-With `docker compose up` running:
-
-```bash
-# 1. Create a user (returns the user + calendarId)
-USER_ID=$(curl -sS -X POST http://localhost:8080/api/users \
-  -H 'Content-Type: application/json' \
-  -d '{"name":"Ada","email":"ada@example.com","timezone":"UTC"}' \
-  | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
-
-# 2. Create a free slot
-SLOT_ID=$(curl -sS -X POST http://localhost:8080/api/users/$USER_ID/slots \
-  -H 'Content-Type: application/json' \
-  -d '{"startTime":"2026-09-01T09:00:00Z","endTime":"2026-09-01T09:30:00Z"}' \
-  | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
-
-# 3. Book it as a meeting
-curl -sS -X POST http://localhost:8080/api/meetings \
-  -H 'Content-Type: application/json' \
-  -d "{\"slotId\":\"$SLOT_ID\",\"organizerId\":\"$USER_ID\",\"title\":\"Kickoff\"}"
-```
-
----
-
-## Project layout
-
-```
-src/main/java/com/doodle/demo
-├── DemoApplication.java
-├── domain/          # JPA entities and enums
-├── repository/      # Spring Data repositories
-├── service/         # Transactional business logic
-└── web/             # REST controllers + DTOs + exception mapper
-src/main/resources
-├── application.properties
-└── db/migration/    # Flyway SQL scripts
-Dockerfile
-docker-compose.yml
-```
-
----
-
-## Design notes
-
-- **Overlap detection** happens at the service layer with a single `count`
-  query; a stronger guarantee would be a Postgres `EXCLUDE USING GIST` range
-  constraint — deferred as it needs the `btree_gist` extension.
-- **Optimistic locking** (`@Version`) on `Slot` prevents two organizers from
-  double-booking the same slot under contention.
-- **`open-in-view=false`** — DB sessions don't leak into the web layer, so
-  lazy-load errors show up early in tests instead of at HTTP time.
-- **Calendar not exposed as REST** — per the brief, "Calendar" is a domain
-  term only. Slots are addressed through `/api/users/{userId}/slots`.
-- **Env-driven datasource** — the same jar runs unchanged in compose, locally,
-  or against a staging DB just by swapping `SPRING_DATASOURCE_*` env vars.
-
-## Next steps (not yet implemented)
-
-- **Testcontainers-Postgres integration test** — exercises the migration script
-  and repository queries end-to-end against a real Postgres.
-- **DB-level exclusion constraint** — `EXCLUDE USING GIST (calendar_id WITH =,
-  tstzrange(start_time, end_time) WITH &&)` would enforce non-overlap at the DB
-  layer (needs the `btree_gist` extension).
-- **Participant response endpoint** — `PATCH /meetings/{id}/participants/{userId}`
-  to set `ACCEPTED` / `DECLINED`.
-- **Pagination** on the list endpoints once slot count grows large.
-- **Authentication** — currently anyone can create slots for anyone. In a real
-  deployment the caller identity would come from a JWT / session and gate
-  writes to their own calendar.
+The React app is intentionally minimal — no react-router, no state library, no toast library. It's four panels backed by four API areas, hydrated on mount from `GET /api/users`, and persists the currently-selected user in `localStorage` so a reload doesn't blank the UI. See [`frontend/README.md`](./frontend/README.md) if you want to run it in Vite dev mode with hot reload instead of the compose-served build.

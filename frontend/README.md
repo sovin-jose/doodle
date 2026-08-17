@@ -1,62 +1,44 @@
-# Doodle frontend
+# Frontend
 
-Small Vite + React + TypeScript UI over the backend API. Covers the four main
-flows the challenge asks for:
+Tiny Vite + React + TypeScript UI over the backend API. Four panels covering the four flows the challenge asks for:
 
-- Create users (each auto-provisions a calendar)
-- Manage a user's slots (create, mark BUSY/FREE, delete)
-- Book meetings from FREE slots (title, description, participants); cancel meetings
-- **Availability** — the "mini Doodle" endpoint: pick a set of users and a time
-  window and see their common free intervals
+- Create users (each auto-provisions a calendar behind the scenes)
+- Manage a user's slots — create, toggle BUSY/FREE, delete
+- Book meetings from FREE slots and cancel them
+- Availability — pick a set of users and a window, see their common free intervals
 
-## Run it
+Kept deliberately small: no react-router, no state library, no toast library. Per-panel `useState`, one shared "selected user" hoisted into `App`, and `localStorage` for the selected-user id so a browser reload doesn't blank the UI.
 
-### Recommended — as part of the compose stack
+## Running it
 
-From the repo root:
+Easiest way is via the compose stack from the repo root, which builds the SPA into static files and serves them from nginx on port 3001:
 
 ```bash
 docker compose up --build
 ```
 
-Open `http://localhost:3000`. The compose stack builds this frontend into a
-static bundle and serves it from nginx, which also reverse-proxies `/api/**`
-and `/actuator/**` to the backend on the compose network. Same-origin from the
-browser's point of view, no CORS needed.
+Open http://localhost:3001. Nginx also reverse-proxies `/api` and `/actuator` back to the `app` service, so the browser sees same-origin requests. No CORS setup needed on the Java side.
 
-### Alternatively — dev mode with hot reload
-
-Backend needs to be up first (from the repo root):
+If you want hot reload, run the backend from compose and Vite locally:
 
 ```bash
-docker compose up --build -d app postgres
-```
-
-Then in `frontend/`:
-
-```bash
+docker compose up -d app postgres     # from repo root
+cd frontend
 npm install
 npm run dev
 ```
 
-Open `http://localhost:5173`. The Vite dev server proxies `/api/**` and
-`/actuator/**` to `http://localhost:8080`.
+Then http://localhost:5173. The Vite dev server proxies `/api` and `/actuator` to `http://localhost:8080` (see `vite.config.ts`).
 
 ## Layout
 
-```
-src/
-├── main.tsx              # React entry
-├── App.tsx               # Composes the four panels
-├── api.ts                # Typed fetch wrapper for /api/*
-├── types.ts              # DTO mirrors of the backend records
-├── styles.css            # A little vanilla CSS
-└── components/
-    ├── UsersPanel.tsx        # POST /api/users, list
-    ├── SlotsPanel.tsx        # slot CRUD + status transitions
-    ├── MeetingsPanel.tsx     # book/cancel meetings
-    └── AvailabilityPanel.tsx # GET /api/availability
-```
+- `src/api.ts` — typed fetch wrapper. Throws with the backend's `message` on non-2xx.
+- `src/types.ts` — mirrors the Java DTOs by hand. Small enough that codegen would be overkill.
+- `src/App.tsx` — hydrates users from `GET /api/users` on mount, composes the four panels.
+- `src/components/*Panel.tsx` — one panel per API area.
 
-Kept deliberately small — no react-router, no state library, no toast library.
-State is per-panel React state + a shared "selected user" in `App`.
+## A few things worth knowing
+
+`datetime-local` inputs are treated as UTC when sent to the backend. That's technically wrong (they're actually local time in the browser) but it keeps the demo focused on scheduling logic rather than timezone plumbing. A real product needs proper zone handling here.
+
+The selected-user id is persisted in `localStorage` under `doodle:selectedUserId` so reloading the tab keeps context. If the persisted user no longer exists on the server (e.g. after wiping the Postgres volume), the persisted selection is dropped silently.
