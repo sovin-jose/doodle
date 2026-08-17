@@ -18,6 +18,9 @@ and is never exposed directly as a REST resource.
 | Persistence    | Spring Data JPA / Hibernate                      |
 | Database       | PostgreSQL 16                                    |
 | Migrations     | Flyway                                           |
+| Docs           | springdoc OpenAPI / Swagger UI                   |
+| Metrics        | Spring Actuator + Micrometer / Prometheus        |
+| Tests          | JUnit 5 + Mockito + AssertJ                      |
 | Build          | Maven (wrapper included: `./mvnw`)               |
 | Packaging      | Multi-stage Docker image (Temurin JDK 21 → JRE)  |
 | Orchestration  | docker compose                                   |
@@ -162,7 +165,48 @@ with participant response statuses (all start as `PENDING`).
 ```http
 GET /api/meetings/{id}
 GET /api/meetings?organizerId={userId}
+DELETE /api/meetings/{id}
 ```
+
+Cancelling a meeting removes the meeting (and its participants) and transitions
+the underlying slot back to `FREE`, freeing the time for a new booking.
+
+### Aggregated availability (the "mini Doodle" endpoint)
+
+Given a set of participants and a time window, returns per-user free/busy
+timelines and — most importantly — the **common free intervals** where a
+meeting could be scheduled with everyone.
+
+```http
+GET /api/availability?userIds=<uuid>,<uuid>,<uuid>&from=2026-09-01T09:00:00Z&to=2026-09-01T18:00:00Z
+```
+
+Response:
+
+```json
+{
+  "from": "2026-09-01T09:00:00Z",
+  "to":   "2026-09-01T18:00:00Z",
+  "users": [
+    {
+      "userId": "…",
+      "free":  [{"start":"2026-09-01T09:00:00Z","end":"2026-09-01T10:30:00Z"}],
+      "busy":  [{"start":"2026-09-01T10:30:00Z","end":"2026-09-01T11:00:00Z"}]
+    }
+  ],
+  "commonFree": [
+    {"start":"2026-09-01T09:30:00Z","end":"2026-09-01T10:30:00Z"}
+  ]
+}
+```
+
+Implementation notes:
+- Single SQL query fetches all overlapping slots across the requested users in
+  one round-trip using the composite `(calendar_id, start_time, end_time)` index.
+- Per-user free intervals are merged, then intersected pairwise
+  (two-pointer sweep) to compute the common free windows.
+- Slots that straddle the window boundary are clipped so results always fit in
+  `[from, to]`.
 
 ### Error shape
 
@@ -179,6 +223,41 @@ Mapping: `404` for not-found, `409` for conflict (overlap / bad state
 transition), `400` for validation errors.
 
 ---
+
+## Observability
+
+| Endpoint                    | Purpose                                   |
+| --------------------------- | ----------------------------------------- |
+| `/actuator/health`          | Liveness/readiness (used by compose)      |
+| `/actuator/info`            | Build metadata                            |
+| `/actuator/metrics`         | JVM + HTTP + Hikari metrics (JSON)        |
+| `/actuator/prometheus`      | Prometheus scrape endpoint                |
+| `/swagger-ui.html`          | Interactive API explorer                  |
+| `/v3/api-docs`              | OpenAPI 3 JSON spec                       |
+
+The compose file's `app` service has an HTTP healthcheck on
+`/actuator/health` and Postgres has a `pg_isready` healthcheck, so
+`docker compose up --wait` will block until both are truly ready.
+
+## Tests
+
+```bash
+./mvnw test
+```
+
+Currently 17 unit tests covering:
+
+- Slot overlap detection, start/end validation, deletion guards, status
+  transition rules (`SlotServiceTest`)
+- Meeting booking transitions the slot to `BOOKED`, cancellation returns it to
+  `FREE`, non-`FREE` slots are rejected (`MeetingServiceTest`)
+- Availability aggregation: interval merging, cross-user intersection, window
+  clipping, empty-input validation (`AvailabilityServiceTest`)
+
+The tests are Mockito-based and infra-free — they run in ~1 second and don't
+require Postgres. A Testcontainers-Postgres integration test is called out in
+"Next steps" and would validate the migration script + repository queries end
+to end.
 
 ## Database migrations
 
@@ -255,7 +334,14 @@ docker-compose.yml
 
 ## Next steps (not yet implemented)
 
-- Aggregated free/busy endpoint for a given time window across multiple users.
-- Integration tests with Testcontainers-Postgres.
-- Actuator + Micrometer metrics, OpenAPI/Swagger UI.
-- Meeting cancellation flow that returns a `BOOKED` slot to `FREE`.
+- **Testcontainers-Postgres integration test** — exercises the migration script
+  and repository queries end-to-end against a real Postgres.
+- **DB-level exclusion constraint** — `EXCLUDE USING GIST (calendar_id WITH =,
+  tstzrange(start_time, end_time) WITH &&)` would enforce non-overlap at the DB
+  layer (needs the `btree_gist` extension).
+- **Participant response endpoint** — `PATCH /meetings/{id}/participants/{userId}`
+  to set `ACCEPTED` / `DECLINED`.
+- **Pagination** on the list endpoints once slot count grows large.
+- **Authentication** — currently anyone can create slots for anyone. In a real
+  deployment the caller identity would come from a JWT / session and gate
+  writes to their own calendar.

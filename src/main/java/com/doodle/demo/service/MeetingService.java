@@ -64,4 +64,13 @@ public class MeetingService {
                 .map(MeetingResponse::of)
                 .toList();
     }
+
+    @Transactional
+    public void cancel(UUID meetingId) {
+        Meeting meeting = meetings.findById(meetingId)
+                .orElseThrow(() -> new NotFoundException("meeting not found: " + meetingId));
+        Slot slot = meeting.getSlot();
+        meetings.delete(meeting);
+        slot.setStatus(SlotStatus.FREE);
+    }
 }
